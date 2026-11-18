@@ -1,0 +1,28 @@
+# Production shape: image from GHCR pinned by the pipeline, three replicas spread across
+# nodes, autoscaling, an Ingress, and a database Secret created outside of git.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ledger
+resources:
+  - namespace.yaml
+  - ../../base
+  - hpa.yaml
+  - ingress.yaml
+images:
+  - name: lease-ledger-api
+    newName: ghcr.io/jainam004747/lease-ledger-api
+    newTag: main
+replicas:
+  - name: ledger-api
+    count: 3
+patches:
+  - target: {kind: PodDisruptionBudget, name: ledger-api}
+    patch: |-
+      - op: replace
+        path: /spec/minAvailable
+        value: 2
+  - target: {kind: Deployment, name: ledger-api}
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/topologySpreadConstraints/0/whenUnsatisfiable
+        value: DoNotSchedule

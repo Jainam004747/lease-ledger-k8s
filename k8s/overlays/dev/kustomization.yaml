@@ -1,0 +1,32 @@
+# Local and CI cluster (kind): the API plus its own Postgres, one namespace.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ledger-dev
+resources:
+  - namespace.yaml
+  - ../../base
+  - ../../postgres
+images:
+  # built by the pipeline and loaded straight into the kind nodes, never pulled
+  - name: lease-ledger-api
+    newName: ghcr.io/jainam004747/lease-ledger-api
+    newTag: ci
+secretGenerator:
+  # Dev-only credentials, generated so the Secret name changes when the values do.
+  - name: postgres-admin
+    literals:
+      - POSTGRES_USER=ledger
+      - POSTGRES_PASSWORD=dev-only-password
+      - POSTGRES_DB=ledger
+  - name: ledger-db
+    literals:
+      - url=postgresql://ledger:dev-only-password@postgres:5432/ledger
+patches:
+  - target: {kind: Deployment, name: ledger-api}
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+      - op: replace
+        path: /spec/template/spec/initContainers/0/imagePullPolicy
+        value: IfNotPresent

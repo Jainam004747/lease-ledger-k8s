@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledger-api
+  labels:
+    app.kubernetes.io/name: ledger-api
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  # If new pods aren't ready within this time the rollout is marked failed,
+  # which is what the pipeline waits on.
+  progressDeadlineSeconds: 90
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0        # never go below the current number of ready pods
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ledger-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: ledger-api
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ledger-api
+      initContainers:
+        - name: migrate
+          image: lease-ledger-api
+          command: ["python", "-m", "app.migrate"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: ledger-db, key: url}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 128Mi}
+          securityContext: &hardened
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      containers:
+        - name: api
+          image: lease-ledger-api
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef: {name: ledger-api}
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: ledger-db, key: url}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {memory: 256Mi}
+          securityContext: *hardened
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            # Give the Service time to stop sending traffic here before the process
+            # starts shutting down. Without this a rollout drops a few requests.
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,21 @@
+# The API accepts traffic on its HTTP port only, and may only call the database and DNS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ledger-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-api
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - ports:
+        - port: 8000
+  egress:
+    - ports:
+        - port: 5432
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP

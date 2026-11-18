@@ -1,7 +1,156 @@
 name: pipeline
-on: workflow_dispatch
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/jainam004747/lease-ledger-api
+
 jobs:
-  setup:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: pytest -v
+
+  manifests:
+    name: Validate Kubernetes manifests
     runs-on: ubuntu-latest
     steps:
-      - run: echo ok
+      - uses: actions/checkout@v4
+      - name: Install kubeconform
+        run: curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz | sudo tar xz -C /usr/local/bin kubeconform
+      - name: Render each overlay and check it against the Kubernetes schemas
+        run: |
+          for overlay in k8s/overlays/*/; do
+            echo "== $overlay"
+            kubectl kustomize "$overlay" | kubeconform -strict -summary -kubernetes-version 1.33.1 -
+          done
+
+  image:
+    name: Build, scan and publish image
+    needs: [test, manifests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=ci
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Check the image
+        run: |
+          docker image ls "$IMAGE"
+          echo "runs as: $(docker run --rm "$IMAGE:ci" id)"
+          docker run --rm "$IMAGE:ci" python -c "import app.main; print('app imports ok')"
+      - name: Scan for vulnerabilities (fail on critical ones that have a fix)
+        uses: anchore/scan-action@v6
+        with:
+          image: ${{ env.IMAGE }}:ci
+          fail-build: true
+          severity-cutoff: critical
+          only-fixed: true
+          output-format: table
+      - name: Save the image for the deploy job
+        run: docker save "$IMAGE:ci" | gzip > image.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar.gz
+          retention-days: 3
+      - name: Push to GitHub Container Registry
+        if: github.event_name == 'push'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          for t in $TAGS; do
+            [ "${t##*:}" = ci ] && continue
+            docker push --quiet "$t"
+            echo "pushed $t"
+          done
+
+  deploy:
+    name: Deploy to Kubernetes (kind) and test rollouts
+    needs: image
+    runs-on: ubuntu-latest
+    environment: kind-staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+      - run: gunzip -c image.tar.gz | docker load
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: ledger
+          config: k8s/kind.yaml
+      - name: Load the image into the cluster nodes
+        run: kind load docker-image "$IMAGE:ci" --name ledger
+      - name: Deploy
+        run: |
+          kubectl apply -k k8s/overlays/dev
+          kubectl -n ledger-dev rollout status statefulset/postgres --timeout=180s
+          kubectl -n ledger-dev rollout status deployment/ledger-api --timeout=180s
+          kubectl -n ledger-dev get pods -o wide
+      - name: Migration logs (two pods started together, one migrated)
+        run: |
+          for p in $(kubectl -n ledger-dev get pods -l app.kubernetes.io/name=ledger-api -o name); do
+            echo "--- $p"
+            kubectl -n ledger-dev logs "$p" -c migrate
+          done
+      - name: Load sample data
+        run: kubectl -n ledger-dev exec deploy/ledger-api -c api -- python -m app.seed
+      - name: Smoke test
+        run: bash scripts/smoke.sh
+      - name: Rollouts under traffic
+        run: bash scripts/rollout.sh
+      - name: Cluster state after the run
+        if: always()
+        run: |
+          kubectl -n ledger-dev get deploy,rs,pods,svc,pdb,networkpolicy
+          kubectl -n ledger-dev get events --sort-by=.lastTimestamp | tail -25
